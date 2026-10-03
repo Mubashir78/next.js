@@ -144,6 +144,7 @@ pub trait ExecuteContext<'e>: Sized {
         task_id2: TaskId,
         category: TaskDataCategory,
     ) -> (Self::TaskGuardImpl, Self::TaskGuardImpl);
+    fn remove_state_dependency(&mut self, reader: TaskId, key: &turbo_tasks::StateKey);
     fn schedule_task(&self, task: &Self::TaskGuardImpl, parent_priority: TaskPriority);
     fn get_current_task_priority(&self) -> TaskPriority;
     /// Record `task` as a GC candidate **if it is in fact collectible**.
@@ -224,6 +225,43 @@ impl TaskLockCounter {
     }
 }
 
+thread_local! {
+    #[cfg(debug_assertions)]
+    static IN_STATE_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Protects backend-owned state publication and initialization from reentrant
+/// calls while the state store is locked. This does not change legacy State.
+pub(crate) struct StateMutationScope;
+
+impl StateMutationScope {
+    pub(crate) fn enter() -> Self {
+        #[cfg(debug_assertions)]
+        IN_STATE_MUTATION.with(|flag| {
+            assert!(!flag.replace(true), "backend state mutations must not nest");
+        });
+        Self
+    }
+
+    fn assert_not_inside() {
+        #[cfg(debug_assertions)]
+        IN_STATE_MUTATION.with(|flag| {
+            assert!(
+                !flag.get(),
+                "backend state initialization/publication must not call back into turbo-tasks \
+                 while holding the state store lock"
+            );
+        });
+    }
+}
+
+impl Drop for StateMutationScope {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        IN_STATE_MUTATION.with(|flag| flag.set(false));
+    }
+}
+
 pub struct ExecuteContextImpl<'e> {
     backend: &'e TurboTasksBackend,
     turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
@@ -241,6 +279,7 @@ impl<'e> ExecuteContextImpl<'e> {
         backend: &'e TurboTasksBackend,
         turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
     ) -> Self {
+        StateMutationScope::assert_not_inside();
         Self {
             backend,
             turbo_tasks,
@@ -259,6 +298,7 @@ impl<'e> ExecuteContextImpl<'e> {
         turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
         shutdown_guard: RwLockReadGuard<'e, bool>,
     ) -> Self {
+        StateMutationScope::assert_not_inside();
         Self {
             backend,
             turbo_tasks,
@@ -1017,6 +1057,32 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
         category: TaskDataCategory,
     ) -> Option<Self::TaskGuardImpl> {
         self.open_task(task_id, category, TaskAccess::AllowMissing)
+    }
+
+    fn remove_state_dependency(&mut self, reader: TaskId, key: &turbo_tasks::StateKey) {
+        // State before reader, as for registration. The caller has released its
+        // task guard, so a re-read either revives the edge or observes removal.
+        let backend = self.backend;
+        let mut states = backend.states.lock();
+        let Some(mut task) = self.try_task(reader, TaskDataCategory::Data) else {
+            if let Some(state) = states.get_mut(key) {
+                state.dependents.remove(&reader);
+                backend
+                    .state_dirty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            return;
+        };
+        let shared_key = Arc::new(key.clone());
+        if task.remove_outdated_state_dependencies(&shared_key) {
+            task.remove_state_dependencies(&shared_key);
+            if let Some(state) = states.get_mut(key) {
+                state.dependents.remove(&reader);
+                backend
+                    .state_dirty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     fn task_or_create(
@@ -1804,7 +1870,7 @@ pub use self::{
     },
     connect_child::connect_child,
     connect_children::connect_children,
-    invalidate::{invalidate, make_task_dirty_internal},
+    invalidate::{invalidate, make_task_dirty_internal, try_make_task_dirty},
     leaf_distance_update::LeafDistanceUpdateQueue,
     prepare_new_children::prepare_new_children,
     update_cell::update_cell,
